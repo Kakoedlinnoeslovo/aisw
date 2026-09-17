@@ -87,7 +87,26 @@ pub fn read_generic_password(service: &str, account: Option<&str>) -> Result<Opt
         );
     }
 
-    Ok(Some(output.stdout))
+    Ok(Some(strip_cli_output_terminator(output.stdout)))
+}
+
+/// Removes the single trailing newline `security(1)` writes after a `-w` value.
+///
+/// That byte is part of the CLI's output framing, not the stored secret, and it
+/// cannot be confused with data: `security` switches from text to hex output as
+/// soon as the stored value contains a newline anywhere, so a value printed as
+/// text provably has none of its own. Exactly one byte comes off — a trailing
+/// space *is* data and survives text mode intact, and the hex form legitimately
+/// decodes to bytes that end in a newline.
+///
+/// Leaving it on meant aisw stored the terminator and wrote it back verbatim
+/// through `set_generic_password`, which pushed the Keychain item into the hex
+/// form that Claude Code's own reader cannot parse (#250).
+fn strip_cli_output_terminator(mut stdout: Vec<u8>) -> Vec<u8> {
+    if stdout.last() == Some(&b'\n') {
+        stdout.pop();
+    }
+    stdout
 }
 
 pub fn upsert_generic_password(
@@ -337,7 +356,7 @@ mod tests {
                 "#!/bin/sh\n\
                  printf '%s ' \"$@\" > \"{}\"\n\
                  if [ \"$1\" = \"find-generic-password\" ] && [ \"$2\" = \"-s\" ] && [ \"$3\" = \"Claude Code-credentials\" ] && [ \"$4\" = \"-a\" ] && [ \"$5\" = \"tester\" ] && [ \"$6\" = \"-w\" ]; then\n\
-                   printf '{{\"oauthToken\":\"tok\"}}'\n\
+                   printf '{{\"oauthToken\":\"tok\"}}\\n'\n\
                    exit 0\n\
                  fi\n\
                  exit 1\n",
@@ -357,6 +376,102 @@ mod tests {
             fs::read_to_string(marker).unwrap(),
             "find-generic-password -s Claude Code-credentials -a tester -w "
         );
+    }
+
+    #[test]
+    fn strip_cli_output_terminator_removes_exactly_one_newline() {
+        assert_eq!(strip_cli_output_terminator(b"{}\n".to_vec()), b"{}");
+        // The hex form decodes to bytes that may legitimately end in a
+        // newline, so only the CLI's own terminator comes off.
+        assert_eq!(strip_cli_output_terminator(b"{}\n\n".to_vec()), b"{}\n");
+        // A trailing space survives `security`'s text mode, so it is data.
+        assert_eq!(strip_cli_output_terminator(b"{} \n".to_vec()), b"{} ");
+        assert_eq!(strip_cli_output_terminator(b"{}".to_vec()), b"{}");
+        assert_eq!(strip_cli_output_terminator(Vec::new()), b"");
+        assert_eq!(strip_cli_output_terminator(b"\n".to_vec()), b"");
+        // Binary payloads must survive untouched apart from the terminator.
+        assert_eq!(
+            strip_cli_output_terminator(b"\x00\xff\n".to_vec()),
+            b"\x00\xff"
+        );
+    }
+
+    /// The real `security -w` always terminates its output with a newline.
+    /// Keeping it meant aisw wrote it back into the Keychain item, which
+    /// forced the hex form Claude Code cannot read (#250).
+    #[test]
+    #[cfg(unix)]
+    fn read_generic_password_strips_the_cli_output_terminator() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("security");
+        write_mock_security(
+            &bin,
+            "#!/bin/sh\nprintf '{\"claudeAiOauth\":{\"accessToken\":\"tok\"}}\\n'\n",
+        );
+        let _security = EnvVarGuard::set("AISW_SECURITY_BIN", &bin);
+
+        let bytes = read_generic_password("Claude Code-credentials", None)
+            .unwrap()
+            .expect("password");
+        assert_eq!(bytes, br#"{"claudeAiOauth":{"accessToken":"tok"}}"#);
+    }
+
+    /// Guards against "simplifying" the strip into a `trim_ascii_end`: a
+    /// trailing space is preserved by `security`'s text mode, so it is part
+    /// of the secret and discarding it would silently corrupt the value.
+    #[test]
+    #[cfg(unix)]
+    fn read_generic_password_preserves_trailing_space_in_the_value() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("security");
+        write_mock_security(&bin, "#!/bin/sh\nprintf 'secret \\n'\n");
+        let _security = EnvVarGuard::set("AISW_SECURITY_BIN", &bin);
+
+        let bytes = read_generic_password("aisw", None)
+            .unwrap()
+            .expect("password");
+        assert_eq!(bytes, b"secret ");
+    }
+
+    /// An empty stored value must stay distinguishable from a missing item:
+    /// `Some(vec![])`, never `None`, so callers do not treat a wiped secret
+    /// as "no profile configured" and skip the write that would repair it.
+    #[test]
+    #[cfg(unix)]
+    fn read_generic_password_reports_an_empty_value_as_present() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("security");
+        write_mock_security(&bin, "#!/bin/sh\nprintf '\\n'\n");
+        let _security = EnvVarGuard::set("AISW_SECURITY_BIN", &bin);
+
+        assert_eq!(
+            read_generic_password("Claude Code-credentials", None).unwrap(),
+            Some(Vec::new())
+        );
+    }
+
+    /// `security` emits hex whenever the stored value contains a newline. The
+    /// reader must hand that form through byte-for-byte; decoding it is the
+    /// credential layer's job.
+    #[test]
+    #[cfg(unix)]
+    fn read_generic_password_passes_the_hex_form_through_unchanged() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("security");
+        write_mock_security(
+            &bin,
+            "#!/bin/sh\nprintf '7b226f61757468546f6b656e223a22746f6b227d0a\\n'\n",
+        );
+        let _security = EnvVarGuard::set("AISW_SECURITY_BIN", &bin);
+
+        let bytes = read_generic_password("Claude Code-credentials", None)
+            .unwrap()
+            .expect("password");
+        assert_eq!(bytes, b"7b226f61757468546f6b656e223a22746f6b227d0a");
     }
 
     #[test]
@@ -456,7 +571,7 @@ mod tests {
                 "#!/bin/sh\n\
                  printf '%s ' \"$@\" > \"{}\"\n\
                  if [ \"$1\" = \"find-generic-password\" ] && [ \"$2\" = \"-s\" ] && [ \"$3\" = \"aisw\" ] && [ \"$4\" = \"-a\" ] && [ \"$5\" = \"profile:claude:default\" ] && [ \"$6\" = \"-w\" ]; then\n\
-                   printf 'secret'\n\
+                   printf 'secret\\n'\n\
                    exit 0\n\
                  fi\n\
                  exit 1\n",
