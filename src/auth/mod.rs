@@ -14,6 +14,23 @@ pub mod token_expiry;
 
 use anyhow::{bail, Result};
 
+/// Trim ASCII whitespace from the edges of a stored credential payload.
+///
+/// Agent credentials are JSON documents, so surrounding whitespace means
+/// nothing to any reader — but it is not harmless. `security(1)` prints a
+/// Keychain value containing a newline as hex rather than text, and Claude Code
+/// reads its own item with that command and expects JSON, so a single stray
+/// newline in a value aisw writes logs the user out of every session (#250).
+///
+/// Applying this on both read and persist is deliberate: a profile captured
+/// before that fix carries the newline on disk, and trimming on read lets the
+/// next switch repair the live item without a migration step. Trimming is safe
+/// here, unlike at the `security` transport layer, precisely because the
+/// payload is known to be JSON.
+pub(crate) fn trim_credential_payload(bytes: &[u8]) -> &[u8] {
+    bytes.trim_ascii()
+}
+
 /// Reject an API key that is empty or contains control characters.
 ///
 /// Control characters are refused because stored credentials are later
@@ -45,7 +62,34 @@ pub(crate) fn validate_api_key_charset(key: &str, tool_label: &str, help: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::validate_api_key_charset;
+    use super::{trim_credential_payload, validate_api_key_charset};
+
+    #[test]
+    fn trims_the_whitespace_that_makes_security_switch_to_hex() {
+        assert_eq!(trim_credential_payload(b"{\"a\":1}\n"), b"{\"a\":1}");
+        assert_eq!(
+            trim_credential_payload(b"\n\t {\"a\":1} \r\n"),
+            b"{\"a\":1}"
+        );
+        assert_eq!(trim_credential_payload(b"{\"a\":1}"), b"{\"a\":1}");
+    }
+
+    /// Only the edges. Whitespace inside a JSON string is part of the value —
+    /// an access token is opaque and must survive byte-for-byte.
+    #[test]
+    fn leaves_whitespace_inside_the_payload_alone() {
+        let payload = b"{\"token\":\"a b\\nc\"}";
+        assert_eq!(trim_credential_payload(payload), payload);
+    }
+
+    #[test]
+    fn trimming_is_idempotent_and_handles_degenerate_input() {
+        let once = trim_credential_payload(b"  {}  ");
+        assert_eq!(trim_credential_payload(once), once);
+        assert_eq!(trim_credential_payload(b""), b"");
+        assert_eq!(trim_credential_payload(b"   "), b"");
+        assert_eq!(trim_credential_payload(b"\x00{}\x00"), b"\x00{}\x00");
+    }
 
     #[test]
     fn accepts_a_normal_key() {
