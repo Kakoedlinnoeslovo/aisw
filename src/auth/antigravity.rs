@@ -173,12 +173,19 @@ pub fn read_api_key(
         .context("managed Antigravity API key is missing apiKey field")
 }
 
+/// Reads the managed keyring secret for a profile.
+///
+/// The payload is trimmed on the way out, and `persist_managed_secret` trims on
+/// the way in, so a profile captured before #250 — when the `security` CLI's
+/// output terminator was stored along with the secret — stops reporting drift
+/// against a live value that no longer carries it, and is repaired by the next
+/// switch instead of needing a migration.
 pub fn read_managed_secret(
     profile_store: &ProfileStore,
     profile_name: &str,
     backend: CredentialBackend,
 ) -> Result<Option<Vec<u8>>> {
-    match backend {
+    let secret = match backend {
         CredentialBackend::File => {
             let path = profile_store
                 .validated_profile_dir(Tool::Antigravity, profile_name)?
@@ -193,7 +200,9 @@ pub fn read_managed_secret(
         CredentialBackend::SystemKeyring => {
             secure_store::read_profile_secret(Tool::Antigravity, profile_name)
         }
-    }
+    }?;
+
+    Ok(secret.map(|bytes| super::trim_credential_payload(&bytes).to_vec()))
 }
 
 pub fn persist_managed_secret(
@@ -202,6 +211,7 @@ pub fn persist_managed_secret(
     backend: CredentialBackend,
     secret: &[u8],
 ) -> Result<()> {
+    let secret = super::trim_credential_payload(secret);
     match backend {
         CredentialBackend::File => {
             profile_store.write_file(Tool::Antigravity, profile_name, SECRET_FILE, secret)
@@ -1108,6 +1118,86 @@ mod tests {
             &user_home,
         )
         .unwrap());
+    }
+
+    /// Profiles captured before #250 stored the `security` output terminator
+    /// along with the secret. Once the reader stopped returning it, a raw byte
+    /// comparison would have reported drift on every such profile — so the
+    /// managed copy is trimmed on read and repaired on the next persist.
+    #[test]
+    fn live_state_matches_tolerates_a_legacy_trailing_newline_in_the_managed_secret() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempdir().unwrap();
+        let _keyring = EnvVarGuard::set("AISW_KEYRING_TEST_DIR", temp.path());
+        let home = temp.path().join("home");
+        let user_home = temp.path().join("user");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+
+        let profile_store = ProfileStore::new(&home);
+        let config_store = ConfigStore::new(&home);
+        write_live_state(&user_home, br#"{"email":"work@example.com"}"#);
+        let snapshot = capture_live_snapshot(&user_home).unwrap();
+
+        profile_store.create(Tool::Antigravity, "work").unwrap();
+        write_profile_snapshot(
+            &profile_store,
+            &config_store,
+            "work",
+            None,
+            CredentialBackend::File,
+            &snapshot,
+            false,
+        )
+        .unwrap();
+
+        // Re-create the pre-fix on-disk state, bypassing the trimming writer.
+        profile_store
+            .write_file(
+                Tool::Antigravity,
+                "work",
+                SECRET_FILE,
+                b"{\"email\":\"work@example.com\"}\n",
+            )
+            .unwrap();
+
+        assert!(live_state_matches(
+            &profile_store,
+            "work",
+            AuthMethod::OAuth,
+            CredentialBackend::File,
+            &user_home,
+        )
+        .unwrap());
+    }
+
+    /// Trimming must not paper over a genuinely different account.
+    #[test]
+    fn read_managed_secret_trims_without_changing_the_identity() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempdir().unwrap();
+        let _keyring = EnvVarGuard::set("AISW_KEYRING_TEST_DIR", temp.path());
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let profile_store = ProfileStore::new(&home);
+        profile_store.create(Tool::Antigravity, "work").unwrap();
+        persist_managed_secret(
+            &profile_store,
+            "work",
+            CredentialBackend::File,
+            b"\n  {\"email\":\"work@example.com\"}  \n",
+        )
+        .unwrap();
+
+        let stored = read_managed_secret(&profile_store, "work", CredentialBackend::File)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, br#"{"email":"work@example.com"}"#);
+        assert_eq!(
+            identity::resolve_identity_from_json_bytes(&stored).unwrap(),
+            identity::resolve_identity_from_json_bytes(br#"{"email":"work@example.com"}"#).unwrap()
+        );
     }
 
     #[test]
