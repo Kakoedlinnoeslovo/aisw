@@ -286,7 +286,6 @@ mod tests {
             Self { key, old }
         }
 
-        #[cfg(not(target_os = "macos"))]
         fn unset(key: &'static str) -> Self {
             let old = std::env::var_os(key);
             std::env::remove_var(key);
@@ -556,6 +555,129 @@ mod tests {
         assert!(err
             .to_string()
             .contains("could not inspect macOS Keychain generic password"));
+    }
+
+    /// Pins the `security(1)` behaviour the reader is written against, using
+    /// the real binary rather than a stub.
+    ///
+    /// Every other test here mocks `security`, and a mock cannot model the one
+    /// thing that mattered in #250: the CLI switches from text to hex output
+    /// the moment the stored value contains a newline, and that switch happens
+    /// inside the binary. If a future macOS changes the framing or the
+    /// threshold for the hex form, the fix's central assumption — that a
+    /// text-mode value provably has no newline of its own — stops holding, and
+    /// this is what says so.
+    ///
+    /// Hermetic: a throwaway keychain in a temp dir, never added to the search
+    /// list, so the login keychain is not consulted and no real credential is
+    /// touched. The item is both written and read by `security` itself, so
+    /// there is no cross-application access check to prompt for.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn real_security_cli_output_framing_matches_the_reader() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().unwrap();
+        let keychain = dir.path().join("aisw-test.keychain-db");
+
+        let created = Command::new("security")
+            .args(["create-keychain", "-p", "aisw-test"])
+            .arg(&keychain)
+            .output()
+            .expect("security should be available on macOS");
+        assert!(
+            created.status.success(),
+            "could not create the throwaway keychain: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let _keychain_cleanup = ThrowawayKeychain(keychain.clone());
+
+        let unlocked = Command::new("security")
+            .args(["unlock-keychain", "-p", "aisw-test"])
+            .arg(&keychain)
+            .output()
+            .expect("security should be available on macOS");
+        assert!(unlocked.status.success(), "could not unlock the keychain");
+
+        let _bin = EnvVarGuard::unset("AISW_SECURITY_BIN");
+        let _path = EnvVarGuard::set("AISW_SECURITY_KEYCHAIN", &keychain);
+
+        // Text form: the CLI appends a terminator the reader has to drop, and
+        // a trailing space inside the value survives, which is why only the
+        // final newline may come off.
+        store_exact(&keychain, "clean", b"{\"oauthToken\":\"tok\"} ");
+        assert_eq!(
+            read_generic_password("clean", Some("tester"))
+                .unwrap()
+                .unwrap(),
+            b"{\"oauthToken\":\"tok\"} ",
+            "the reader must strip the CLI terminator and nothing else"
+        );
+
+        // Hex form: this is the state #250 left the Keychain in. The reader
+        // hands it through, and the credential layer decodes it back to the
+        // original bytes, trimming only the edges.
+        let with_newline = b"{\"oauthToken\":\"tok\"}\n";
+        store_exact(&keychain, "newline", with_newline);
+        let raw = read_generic_password("newline", Some("tester"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            raw.iter().all(u8::is_ascii_hexdigit),
+            "security should print a value containing a newline as hex, got: {}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert_eq!(
+            crate::auth::claude::normalize_credentials_bytes(&raw).unwrap(),
+            br#"{"oauthToken":"tok"}"#,
+            "decoding the hex form must recover the payload without the newline"
+        );
+
+        // An empty stored value must stay distinguishable from a missing item.
+        assert!(read_generic_password("absent", Some("tester"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// Writes exact bytes into the throwaway keychain via `-X`, so the test
+    /// controls the stored value down to the byte rather than going through
+    /// the CLI's line-oriented password prompt.
+    #[cfg(target_os = "macos")]
+    fn store_exact(keychain: &std::path::Path, service: &str, value: &[u8]) {
+        let hex: String = value.iter().map(|byte| format!("{byte:02x}")).collect();
+        let output = Command::new("security")
+            .args([
+                "add-generic-password",
+                "-U",
+                "-a",
+                "tester",
+                "-s",
+                service,
+                "-X",
+                &hex,
+            ])
+            .arg(keychain)
+            .output()
+            .expect("security should be available on macOS");
+        assert!(
+            output.status.success(),
+            "could not store the {service} fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Deletes the throwaway keychain on drop, so a failed assertion does not
+    /// strand it.
+    #[cfg(target_os = "macos")]
+    struct ThrowawayKeychain(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ThrowawayKeychain {
+        fn drop(&mut self) {
+            let _ = Command::new("security")
+                .arg("delete-keychain")
+                .arg(&self.0)
+                .output();
+        }
     }
 
     #[test]
