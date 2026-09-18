@@ -22,6 +22,16 @@
 
 ### Fixed
 
+- Claude Code no longer reports "Not logged in" after `aisw use` or
+  `aisw add claude --from-live` on macOS. `security find-generic-password -w`
+  terminates its output with a newline, and aisw stored that byte and wrote it
+  back into the Keychain item verbatim. `security` prints any value containing
+  a newline as hex rather than text, and Claude Code reads its own item with
+  that command and expects JSON, so every session on the machine fell back to
+  `/login` — often long after the switch, once a running session re-read the
+  Keychain. Profiles captured before this fix repair themselves on the next
+  switch. The same read path is shared with Antigravity, whose drift detection
+  was affected too.
 - `status` now distinguishes present, missing, and unrecognized credential
   layouts instead of treating any regular profile file as a credential.
 - Backup restore now commits profile metadata only after its files and secure
