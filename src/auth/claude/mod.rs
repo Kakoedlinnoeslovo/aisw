@@ -328,7 +328,16 @@ pub(crate) fn persist_stored_credentials(
     }
 }
 
+/// Canonicalizes a credential payload into the plain JSON object Claude Code
+/// expects, unwrapping the hex form `security(1)` emits for values it cannot
+/// print as text. Returns `None` for anything that is not recognizably a
+/// credential, leaving the caller's bytes untouched.
+///
+/// Both exits trim, so a payload that picked up a stray newline before #250 was
+/// fixed is repaired the next time it passes through here — on read and on
+/// persist alike — rather than being carried forward into the Keychain item.
 pub(crate) fn normalize_credentials_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    let bytes = super::trim_credential_payload(bytes);
     if has_object_json_shape(bytes) {
         return Some(bytes.to_vec());
     }
@@ -341,8 +350,9 @@ pub(crate) fn normalize_credentials_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
         }
 
         let decoded = decode_hex_bytes(text)?;
-        if has_object_json_shape(&decoded) {
-            return Some(decoded);
+        let trimmed = super::trim_credential_payload(&decoded);
+        if has_object_json_shape(trimmed) {
+            return Some(trimmed.to_vec());
         }
         candidate = decoded;
     }
@@ -2087,6 +2097,158 @@ mod tests {
 
         assert_eq!(normalized_once, br#"{"oauthToken":"tok"}"#);
         assert_eq!(normalized_twice, br#"{"oauthToken":"tok"}"#);
+    }
+
+    /// `serde_json` happily parses a document with trailing whitespace, so the
+    /// JSON-shaped early return used to hand the newline straight back — which
+    /// is how it reached the Keychain item in #250.
+    #[test]
+    fn normalize_credentials_bytes_trims_a_json_payload() {
+        assert_eq!(
+            normalize_credentials_bytes(b"{\"oauthToken\":\"tok\"}\n").unwrap(),
+            br#"{"oauthToken":"tok"}"#
+        );
+        assert_eq!(
+            normalize_credentials_bytes(b"\n  {\"oauthToken\":\"tok\"}  \n").unwrap(),
+            br#"{"oauthToken":"tok"}"#
+        );
+    }
+
+    /// Once the newline is in the Keychain, `security` returns the value as
+    /// hex. Decoding it recovers the newline too, so the hex exit has to trim
+    /// as well or the state sustains itself across every switch.
+    #[test]
+    fn normalize_credentials_bytes_trims_the_decoded_hex_payload() {
+        // hex of `{"oauthToken":"tok"}\n`
+        let hex_with_newline = b"7b226f61757468546f6b656e223a22746f6b227d0a";
+        assert_eq!(
+            normalize_credentials_bytes(hex_with_newline).unwrap(),
+            br#"{"oauthToken":"tok"}"#
+        );
+    }
+
+    /// The property that breaks the feedback loop: whatever comes out is a
+    /// fixed point, so repeated read/persist cycles cannot accumulate anything.
+    #[test]
+    fn normalize_credentials_bytes_is_idempotent() {
+        for payload in [
+            b"{\"oauthToken\":\"tok\"}\n".as_slice(),
+            b"7b226f61757468546f6b656e223a22746f6b227d0a".as_slice(),
+            b"  {\"apiKey\":\"sk-ant\"}  ".as_slice(),
+        ] {
+            let once = normalize_credentials_bytes(payload).unwrap();
+            assert_eq!(normalize_credentials_bytes(&once).unwrap(), once);
+        }
+    }
+
+    /// Anything unrecognized must come back `None` so callers keep the original
+    /// bytes rather than persisting a half-understood payload. Trimming must
+    /// not turn a rejection into an accidental match either.
+    #[test]
+    fn normalize_credentials_bytes_rejects_payloads_it_cannot_identify() {
+        for payload in [
+            b"".as_slice(),
+            b"   ".as_slice(),
+            b"not json at all".as_slice(),
+            b"[1,2,3]".as_slice(),      // valid JSON, but not an object
+            b"\"a string\"".as_slice(), // ditto
+            b"7b226f61757468546f6b656e223a22746f6b227".as_slice(), // odd-length hex
+            b"zzzz".as_slice(),
+            &[0x80, 0x81, 0x82], // not UTF-8
+        ] {
+            assert!(
+                normalize_credentials_bytes(payload).is_none(),
+                "expected {payload:?} to be rejected"
+            );
+        }
+    }
+
+    /// The newline survives inside a JSON string value: an access token is
+    /// opaque and must round-trip byte-for-byte.
+    #[test]
+    fn normalize_credentials_bytes_preserves_the_payload_body() {
+        let payload = b"{\"oauthToken\":\"line-one\\nline-two\"}";
+        assert_eq!(normalize_credentials_bytes(payload).unwrap(), payload);
+    }
+
+    /// End-to-end guard for the reported symptom: a profile captured before
+    /// the fix has the newline on disk, and the next switch must write a clean
+    /// value rather than carrying it into the Keychain item.
+    #[test]
+    fn keychain_apply_repairs_a_profile_stored_with_a_trailing_newline() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().unwrap();
+        let user_home = dir.path().join("home");
+        fs::create_dir_all(&user_home).unwrap();
+
+        let _storage = EnvVarGuard::set("AISW_CLAUDE_AUTH_STORAGE", "keychain");
+        let _keyring = EnvVarGuard::set("AISW_KEYRING_TEST_DIR", dir.path().join("keyring"));
+
+        let (ps, _cs) = stores(dir.path());
+        ps.create(Tool::Claude, "work").unwrap();
+        ps.write_file(
+            Tool::Claude,
+            "work",
+            CREDENTIALS_FILE,
+            b"{\"oauthToken\":\"tok\"}\n",
+        )
+        .unwrap();
+
+        apply_live_credentials(
+            &ps,
+            "work",
+            CredentialBackend::File,
+            &user_home,
+            StateMode::Shared,
+        )
+        .unwrap();
+
+        let live = keychain::read_keychain_credentials().unwrap().unwrap();
+        assert_eq!(
+            live, br#"{"oauthToken":"tok"}"#,
+            "apply must not carry the stored newline into the Keychain item"
+        );
+        assert!(live_credentials_match(
+            &ps,
+            "work",
+            CredentialBackend::File,
+            &user_home,
+            StateMode::Shared,
+        )
+        .unwrap());
+    }
+
+    /// A payload aisw does not recognize is applied verbatim rather than
+    /// mangled — the switch still leaves the agent with exactly what the user
+    /// stored, and drift detection stays truthful about it.
+    #[test]
+    fn keychain_apply_leaves_an_unrecognized_payload_byte_identical() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().unwrap();
+        let user_home = dir.path().join("home");
+        fs::create_dir_all(&user_home).unwrap();
+
+        let _storage = EnvVarGuard::set("AISW_CLAUDE_AUTH_STORAGE", "keychain");
+        let _keyring = EnvVarGuard::set("AISW_KEYRING_TEST_DIR", dir.path().join("keyring"));
+
+        let (ps, _cs) = stores(dir.path());
+        ps.create(Tool::Claude, "work").unwrap();
+        ps.write_file(Tool::Claude, "work", CREDENTIALS_FILE, b"opaque-blob\n")
+            .unwrap();
+
+        apply_live_credentials(
+            &ps,
+            "work",
+            CredentialBackend::File,
+            &user_home,
+            StateMode::Shared,
+        )
+        .unwrap();
+
+        assert_eq!(
+            keychain::read_keychain_credentials().unwrap().unwrap(),
+            b"opaque-blob\n"
+        );
     }
 
     #[test]
